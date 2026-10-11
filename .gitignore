@@ -1,9 +1,12 @@
 # Environment variables
 .env
+.env.local
 .env.*
+!.env.example
 backend/.env
+backend/.env.local
 backend/.env.*
-*.env
+!backend/.env.example
 
 # Logs
 logs

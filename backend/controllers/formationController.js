@@ -22,16 +22,27 @@ exports.getPublishedFormations = async (req, res) => {
     }
 };
 
+// M4 FIX: Validate title, description and price format
 exports.createFormation = async (req, res) => {
     const { title, description, price, currency, is_published, thumbnail_url } = req.body;
+    
+    if (!title || typeof title !== 'string' || title.trim().length < 3) {
+        return res.status(400).json({ error: 'Title is required (minimum 3 characters).' });
+    }
+
+    const numPrice = parseFloat(price ?? 0);
+    if (isNaN(numPrice) || numPrice < 0) {
+        return res.status(400).json({ error: 'Price must be a valid non-negative number.' });
+    }
+
     const id = crypto.randomUUID();
     const created_by = req.user.id;
     try {
         await db.execute(
             'INSERT INTO formations (id, title, description, price, currency, is_published, thumbnail_url, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [id, title, description, price || 0, currency || 'USD', is_published ? 1 : 0, thumbnail_url || null, created_by]
+            [id, title.trim(), description ? description.trim() : '', numPrice, currency || 'USD', is_published ? 1 : 0, thumbnail_url || null, created_by]
         );
-        res.status(201).json({ id, title, description, price, currency, is_published, thumbnail_url });
+        res.status(201).json({ id, title: title.trim(), description, price: numPrice, currency, is_published, thumbnail_url });
     } catch (err) {
         console.error('[createFormation]', err);
         res.status(500).json({ error: 'Failed to create formation' });
@@ -41,12 +52,22 @@ exports.createFormation = async (req, res) => {
 exports.updateFormation = async (req, res) => {
     const { id } = req.params;
     const { title, description, price, currency, is_published, thumbnail_url } = req.body;
+
+    if (title !== undefined && (typeof title !== 'string' || title.trim().length < 3)) {
+        return res.status(400).json({ error: 'Title must be at least 3 characters long.' });
+    }
+
+    const numPrice = price !== undefined ? parseFloat(price) : undefined;
+    if (numPrice !== undefined && (isNaN(numPrice) || numPrice < 0)) {
+        return res.status(400).json({ error: 'Price must be a valid non-negative number.' });
+    }
+
     try {
         await db.execute(
-            'UPDATE formations SET title = ?, description = ?, price = ?, currency = ?, is_published = ?, thumbnail_url = ?, updated_at = NOW() WHERE id = ?',
-            [title, description, price || 0, currency || 'USD', is_published ? 1 : 0, thumbnail_url || null, id]
+            'UPDATE formations SET title = COALESCE(?, title), description = COALESCE(?, description), price = COALESCE(?, price), currency = COALESCE(?, currency), is_published = COALESCE(?, is_published), thumbnail_url = COALESCE(?, thumbnail_url), updated_at = NOW() WHERE id = ?',
+            [title ? title.trim() : null, description !== undefined ? description : null, numPrice !== undefined ? numPrice : null, currency || null, is_published !== undefined ? (is_published ? 1 : 0) : null, thumbnail_url !== undefined ? thumbnail_url : null, id]
         );
-        res.json({ id, title, description, price, currency, is_published, thumbnail_url });
+        res.json({ id, title, description, price: numPrice, currency, is_published, thumbnail_url });
     } catch (err) {
         console.error('[updateFormation]', err);
         res.status(500).json({ error: 'Failed to update formation' });
@@ -201,11 +222,23 @@ exports.getStudentEnrollments = async (req, res) => {
     }
 };
 
+// C8 FIX: Validate allowed payment_status values
 exports.updateEnrollmentStatus = async (req, res) => {
     const { id } = req.params;
     const { status } = req.body;
+    const ALLOWED_STATUSES = ['pending', 'approved', 'rejected', 'cancelled'];
+
+    if (!status || !ALLOWED_STATUSES.includes(status)) {
+        return res.status(400).json({ 
+            error: `Invalid status. Allowed values: ${ALLOWED_STATUSES.join(', ')}` 
+        });
+    }
+
     try {
-        await db.execute('UPDATE formation_enrollments SET payment_status = ? WHERE id = ?', [status, id]);
+        const [result] = await db.execute('UPDATE formation_enrollments SET payment_status = ? WHERE id = ?', [status, id]);
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Enrollment record not found' });
+        }
         res.json({ message: 'Enrollment status updated' });
     } catch (err) {
         console.error('[updateEnrollmentStatus]', err);
@@ -346,43 +379,76 @@ exports.updateStudentProgress = async (req, res) => {
 
 // --- PAYMENT SUBMISSION (ENROLL) ---
 // M12 FIX: Validate payment amount and currency
+// --- PAYMENT SUBMISSION (ENROLL) ---
+// M12 & H3 FIX: Validate payment amount, currency, prevent duplicate enrollment, and use transaction
 exports.submitPayment = async (req, res) => {
     const userId = req.user.id;
     const { formationId, amount, currency, paymentMethod, referenceNumber, notes } = req.body;
     
+    if (!formationId) {
+        return res.status(400).json({ error: 'Formation ID is required' });
+    }
+
+    const conn = await db.getConnection();
     try {
-        const [student] = await db.execute('SELECT id FROM students WHERE user_id = ?', [userId]);
-        if (student.length === 0) return res.status(404).json({ error: 'Student profile not found' });
+        const [student] = await conn.execute('SELECT id FROM students WHERE user_id = ?', [userId]);
+        if (student.length === 0) {
+            conn.release();
+            return res.status(404).json({ error: 'Student profile not found' });
+        }
         
-        // M12 FIX: Check formation existence and positive amount
-        const [formationRows] = await db.execute('SELECT price, currency FROM formations WHERE id = ?', [formationId]);
-        if (formationRows.length === 0) return res.status(404).json({ error: 'Formation not found' });
+        const [formationRows] = await conn.execute('SELECT price, currency FROM formations WHERE id = ?', [formationId]);
+        if (formationRows.length === 0) {
+            conn.release();
+            return res.status(404).json({ error: 'Formation not found' });
+        }
 
         const formation = formationRows[0];
         const numAmount = parseFloat(amount);
         if (isNaN(numAmount) || numAmount < 0) {
+            conn.release();
             return res.status(400).json({ error: 'Invalid payment amount' });
         }
 
         const studentId = student[0].id;
+
+        // H3 FIX: Check if already enrolled or pending
+        const [existingEnrollment] = await conn.execute(
+            'SELECT id, payment_status FROM formation_enrollments WHERE formation_id = ? AND student_id = ? AND payment_status IN ("approved", "pending")',
+            [formationId, studentId]
+        );
+        if (existingEnrollment.length > 0) {
+            conn.release();
+            const status = existingEnrollment[0].payment_status;
+            return res.status(409).json({ 
+                error: status === 'approved' ? 'You are already enrolled in this formation' : 'You already have a pending enrollment for this formation' 
+            });
+        }
+
+        await conn.beginTransaction();
+
         const paymentId = crypto.randomUUID();
         const enrollmentId = crypto.randomUUID();
 
         // 1. Create Payment record
-        await db.execute(
+        await conn.execute(
             'INSERT INTO formation_payments (id, formation_id, student_id, amount, currency, payment_method, reference_number, notes, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "pending")',
             [paymentId, formationId, studentId, numAmount, currency || formation.currency || 'USD', paymentMethod, referenceNumber || null, notes || null]
         );
 
         // 2. Create Enrollment record (initially pending)
-        await db.execute(
+        await conn.execute(
             'INSERT INTO formation_enrollments (id, formation_id, student_id, payment_status, payment_id) VALUES (?, ?, ?, "pending", ?)',
             [enrollmentId, formationId, studentId, paymentId]
         );
 
+        await conn.commit();
         res.status(201).json({ paymentId, enrollmentId });
     } catch (err) {
+        await conn.rollback();
         console.error('[submitPayment]', err);
         res.status(500).json({ error: 'Payment submission failed' });
+    } finally {
+        conn.release();
     }
 };

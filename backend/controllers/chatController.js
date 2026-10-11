@@ -142,11 +142,25 @@ exports.getOrCreateDirectConversation = async (req, res) => {
 };
 
 // --- GET OR CREATE COHORT GROUP CONVERSATION ---
+// H6 FIX: Verify user belongs to cohort or is an admin before allowing group conversation access
 exports.getOrCreateCohortConversation = async (req, res) => {
     const { cohort_id, name } = req.body;
     if (!cohort_id) return res.status(400).json({ error: 'cohort_id is required' });
 
     try {
+        if (req.user.role !== 'admin') {
+            const [studentMatch] = await db.execute('SELECT 1 FROM students WHERE user_id = ? AND cohort_id = ?', [req.user.id, cohort_id]);
+            const [teacherMatch] = await db.execute(`
+                SELECT 1 FROM modules m 
+                JOIN teachers t ON m.teacher_id = t.id 
+                WHERE t.user_id = ? AND m.cohort_id = ?
+            `, [req.user.id, cohort_id]);
+
+            if (studentMatch.length === 0 && teacherMatch.length === 0) {
+                return res.status(403).json({ error: 'You do not have permission to access or create conversations for this cohort.' });
+            }
+        }
+
         const [existing] = await db.execute(`
             SELECT id FROM conversations WHERE cohort_id = ? AND type = 'group' LIMIT 1
         `, [cohort_id]);

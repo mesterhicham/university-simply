@@ -1,5 +1,6 @@
 const db = require('../config/db');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 // --- PLATFORM SETTINGS ---
 exports.getSettings = async (req, res) => {
@@ -14,13 +15,22 @@ exports.getSettings = async (req, res) => {
 
 exports.updateSetting = async (req, res) => {
     const { key, value } = req.body;
+    if (!key || typeof key !== 'string' || !/^[a-zA-Z0-9_-]{2,64}$/.test(key.trim())) {
+        return res.status(400).json({ error: 'Valid setting key (alphanumeric, underscore, dash, 2-64 chars) is required' });
+    }
+    if (value === undefined || value === null) {
+        return res.status(400).json({ error: 'Setting value is required' });
+    }
+    const safeKey = key.trim();
+    const strValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+
     try {
         const id = crypto.randomUUID();
         await db.execute(
             'INSERT INTO platform_settings (id, `key`, `value`, updated_at) VALUES (?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`), updated_at = NOW()',
-            [id, key, value]
+            [id, safeKey, strValue]
         );
-        res.json({ key, value });
+        res.json({ key: safeKey, value: strValue });
     } catch (err) {
         console.error('[updateSetting]', err);
         res.status(500).json({ error: 'Failed to update setting' });
@@ -211,25 +221,32 @@ exports.updateUserRole = async (req, res) => {
     }
 };
 
-// M11 FIX: Clean related child records when deleting user to avoid orphaned entries
+// C5 FIX: Transactional deletion to ensure atomicity and avoid orphaned records
 exports.deleteUser = async (req, res) => {
     const { id } = req.params;
     if (id === req.user.id) {
         return res.status(400).json({ error: 'You cannot delete your own admin account.' });
     }
 
+    const conn = await db.getConnection();
     try {
-        // Clean related records
-        await db.execute('DELETE FROM students WHERE user_id = ?', [id]);
-        await db.execute('DELETE FROM teachers WHERE user_id = ?', [id]);
-        await db.execute('DELETE FROM user_roles WHERE user_id = ?', [id]);
-        await db.execute('DELETE FROM profiles WHERE id = ?', [id]);
-        await db.execute('DELETE FROM users WHERE id = ?', [id]);
+        await conn.beginTransaction();
 
+        // Clean related records inside a single transaction
+        await conn.execute('DELETE FROM students WHERE user_id = ?', [id]);
+        await conn.execute('DELETE FROM teachers WHERE user_id = ?', [id]);
+        await conn.execute('DELETE FROM user_roles WHERE user_id = ?', [id]);
+        await conn.execute('DELETE FROM profiles WHERE id = ?', [id]);
+        await conn.execute('DELETE FROM users WHERE id = ?', [id]);
+
+        await conn.commit();
         res.json({ message: 'User deleted successfully' });
     } catch (err) {
+        await conn.rollback();
         console.error('[deleteUser]', err);
         res.status(500).json({ error: 'Failed to delete user' });
+    } finally {
+        conn.release();
     }
 };
 
@@ -511,7 +528,7 @@ exports.getEmailLogs = async (req, res) => {
     }
 };
 
-// --- SEND TEST EMAIL ---
+// --- SEND TEST EMAIL (C7 FIX: Real SMTP verification and accurate status reporting) ---
 exports.sendTestEmail = async (req, res) => {
     const { recipient_email } = req.body;
     if (!recipient_email || !recipient_email.includes('@')) {
@@ -525,15 +542,45 @@ exports.sendTestEmail = async (req, res) => {
             return res.status(400).json({ error: 'Email service is currently disabled. Please enable it in SMTP settings.' });
         }
 
-        const logId = crypto.randomUUID();
-        await db.execute(`
-            INSERT INTO email_logs (id, template_id, recipient_email, recipient_name, recipient_type, subject, body_html, status, error_message, sent_at, created_at)
-            VALUES (?, NULL, ?, 'Test Recipient', 'admin', 'Simply University - SMTP Test Email', '<div style="font-family: sans-serif; padding: 20px;"><h2>Simply University</h2><p>This is a test email sent from Simply University platform to verify SMTP configuration.</p><p>Status: Success</p></div>', 'sent', NULL, NOW(), NOW())
-        `, [logId, recipient_email]);
+        const transporter = nodemailer.createTransport({
+            host: config.smtp_host,
+            port: parseInt(config.smtp_port, 10) || 587,
+            secure: (config.encryption === 'ssl' || parseInt(config.smtp_port, 10) === 465),
+            auth: {
+                user: config.smtp_username,
+                pass: config.smtp_password
+            },
+            tls: {
+                rejectUnauthorized: false
+            }
+        });
 
-        res.json({ success: true, message: `Test email successfully sent to ${recipient_email}` });
+        const logId = crypto.randomUUID();
+        try {
+            await transporter.sendMail({
+                from: `"${config.from_name || 'Simply University'}" <${config.from_email || config.smtp_username}>`,
+                to: recipient_email,
+                subject: 'Simply University - SMTP Test Email',
+                html: '<div style="font-family: sans-serif; padding: 20px;"><h2>Simply University</h2><p>This is a test email sent from Simply University platform to verify SMTP configuration.</p><p>Status: Success</p></div>'
+            });
+
+            await db.execute(`
+                INSERT INTO email_logs (id, template_id, recipient_email, recipient_name, recipient_type, subject, body_html, status, error_message, sent_at, created_at)
+                VALUES (?, NULL, ?, 'Test Recipient', 'admin', 'Simply University - SMTP Test Email', '<div style="font-family: sans-serif; padding: 20px;"><h2>Simply University</h2><p>This is a test email sent from Simply University platform to verify SMTP configuration.</p><p>Status: Success</p></div>', 'sent', NULL, NOW(), NOW())
+            `, [logId, recipient_email]);
+
+            res.json({ success: true, message: `Test email successfully sent to ${recipient_email}` });
+        } catch (mailErr) {
+            console.error('[sendTestEmail SMTP Error]', mailErr);
+            await db.execute(`
+                INSERT INTO email_logs (id, template_id, recipient_email, recipient_name, recipient_type, subject, body_html, status, error_message, sent_at, created_at)
+                VALUES (?, NULL, ?, 'Test Recipient', 'admin', 'Simply University - SMTP Test Email', '<div style="font-family: sans-serif; padding: 20px;"><h2>Simply University</h2><p>This is a test email sent from Simply University platform to verify SMTP configuration.</p><p>Status: Failed</p></div>', 'failed', ?, NULL, NOW())
+            `, [logId, recipient_email, mailErr.message || 'SMTP Connection Failed']);
+
+            res.status(502).json({ error: `Failed to deliver test email: ${mailErr.message}` });
+        }
     } catch (err) {
         console.error('[sendTestEmail]', err);
-        res.status(500).json({ error: 'Failed to send test email' });
+        res.status(500).json({ error: 'Failed to process test email request' });
     }
 };

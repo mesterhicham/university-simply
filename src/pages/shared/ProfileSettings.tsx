@@ -59,15 +59,16 @@ export default function ProfileSettings() {
     }
   });
 
+  const [deletePassword, setDeletePassword] = useState('');
   const deleteAccount = useMutation({
-    mutationFn: userService.deleteAccount,
+    mutationFn: (pwd: string) => userService.deleteAccount(pwd),
     onSuccess: () => {
       signOut();
       toast.success('Account deleted successfully');
       navigate('/');
     },
     onError: (error: any) => {
-      toast.error('Failed to delete account');
+      toast.error(error.response?.data?.error || 'Failed to delete account');
     }
   });
 
@@ -260,10 +261,29 @@ export default function ProfileSettings() {
             <AlertDialog>
               <AlertDialogTrigger asChild><Button variant="destructive">Delete Account</Button></AlertDialogTrigger>
               <AlertDialogContent>
-                <AlertDialogHeader><AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle></AlertDialogHeader>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    This action cannot be undone. Please enter your password to confirm account deletion.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <div className="py-2">
+                  <Input 
+                    type="password"
+                    placeholder="Enter your current password"
+                    value={deletePassword}
+                    onChange={(e) => setDeletePassword(e.target.value)}
+                  />
+                </div>
                 <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <Button variant="destructive" onClick={() => deleteAccount.mutate()}>Delete my account</Button>
+                  <AlertDialogCancel onClick={() => setDeletePassword('')}>Cancel</AlertDialogCancel>
+                  <Button 
+                    variant="destructive" 
+                    disabled={!deletePassword || deleteAccount.isPending}
+                    onClick={() => deleteAccount.mutate(deletePassword)}
+                  >
+                    {deleteAccount.isPending ? 'Deleting...' : 'Confirm Account Deletion'}
+                  </Button>
                 </AlertDialogFooter>
               </AlertDialogContent>
             </AlertDialog>

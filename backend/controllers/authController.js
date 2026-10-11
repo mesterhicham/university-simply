@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
+// C9 & M1 FIX: Transactional registration and strong password enforcement
 exports.register = async (req, res) => {
     const { email, password, fullName, city, country, whatsappNumber, role, specialty, experience } = req.body;
     
@@ -13,8 +14,9 @@ exports.register = async (req, res) => {
         if (!email || !password || !fullName) {
             return res.status(400).json({ error: 'Email, password, and full name are required.' });
         }
-        if (password.length < 8) {
-            return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+        // M1 FIX: Strong password requirements (min 8 chars, letter + number)
+        if (password.length < 8 || !/(?=.*[a-zA-Z])(?=.*[0-9])/.test(password)) {
+            return res.status(400).json({ error: 'Password must be at least 8 characters and include at least one letter and one number.' });
         }
 
         const [existing] = await db.execute('SELECT id FROM users WHERE email = ?', [email]);
@@ -23,38 +25,50 @@ exports.register = async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, 12);
         const userId = crypto.randomUUID();
 
-        // 1. Insert into users table
-        await db.execute(
-            'INSERT INTO users (id, email, password, role) VALUES (?, ?, ?, ?)',
-            [userId, email, hashedPassword, assignedRole]
-        );
+        // C9 FIX: Database transaction ensures complete atomic creation of all related records
+        const conn = await db.getConnection();
+        try {
+            await conn.beginTransaction();
 
-        // 2. Insert into profiles table
-        await db.execute(
-            'INSERT INTO profiles (id, email, full_name, city, country, whatsapp_number) VALUES (?, ?, ?, ?, ?, ?)',
-            [userId, email, fullName, city || '', country || '', whatsappNumber || '']
-        );
-
-        // 3. Insert into user_roles table
-        await db.execute(
-            'INSERT INTO user_roles (id, user_id, role) VALUES (?, ?, ?)',
-            [crypto.randomUUID(), userId, assignedRole]
-        );
-
-        // 4. Role-specific record creation
-        if (assignedRole === 'teacher') {
-            await db.execute(
-                'INSERT INTO teachers (id, user_id, specialty, experience, status) VALUES (?, ?, ?, ?, ?)',
-                [crypto.randomUUID(), userId, specialty || '', experience || '', 'pending']
+            // 1. Insert into users table
+            await conn.execute(
+                'INSERT INTO users (id, email, password, role) VALUES (?, ?, ?, ?)',
+                [userId, email, hashedPassword, assignedRole]
             );
-        } else {
-            await db.execute(
-                'INSERT INTO students (id, user_id, status) VALUES (?, ?, ?)',
-                [crypto.randomUUID(), userId, 'active']
+
+            // 2. Insert into profiles table
+            await conn.execute(
+                'INSERT INTO profiles (id, email, full_name, city, country, whatsapp_number) VALUES (?, ?, ?, ?, ?, ?)',
+                [userId, email, fullName, city || '', country || '', whatsappNumber || '']
             );
+
+            // 3. Insert into user_roles table
+            await conn.execute(
+                'INSERT INTO user_roles (id, user_id, role) VALUES (?, ?, ?)',
+                [crypto.randomUUID(), userId, assignedRole]
+            );
+
+            // 4. Role-specific record creation
+            if (assignedRole === 'teacher') {
+                await conn.execute(
+                    'INSERT INTO teachers (id, user_id, specialty, experience, status) VALUES (?, ?, ?, ?, ?)',
+                    [crypto.randomUUID(), userId, specialty || '', experience || '', 'pending']
+                );
+            } else {
+                await conn.execute(
+                    'INSERT INTO students (id, user_id, status) VALUES (?, ?, ?)',
+                    [crypto.randomUUID(), userId, 'active']
+                );
+            }
+
+            await conn.commit();
+            res.status(201).json({ message: 'User registered successfully. ' + (assignedRole === 'teacher' ? 'Your account is pending admin approval.' : '') });
+        } catch (txErr) {
+            await conn.rollback();
+            throw txErr;
+        } finally {
+            conn.release();
         }
-
-        res.status(201).json({ message: 'User registered successfully. ' + (assignedRole === 'teacher' ? 'Your account is pending admin approval.' : '') });
     } catch (err) {
         console.error('[register]', err);
         res.status(500).json({ error: 'Registration failed.' });
@@ -112,8 +126,8 @@ exports.changePassword = async (req, res) => {
     const { currentPassword, newPassword } = req.body;
     try {
         // H8 FIX: Validate new password quality
-        if (!newPassword || newPassword.length < 8) {
-            return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+        if (!newPassword || newPassword.length < 8 || !/(?=.*[a-zA-Z])(?=.*[0-9])/.test(newPassword)) {
+            return res.status(400).json({ error: 'New password must be at least 8 characters and include at least one letter and one number.' });
         }
 
         const [users] = await db.execute('SELECT password FROM users WHERE id = ?', [req.user.id]);
@@ -132,9 +146,12 @@ exports.changePassword = async (req, res) => {
 };
 
 // --- ADMIN SETUP (First Admin) ---
+// C1 FIX: Check both user_roles and users table, and optionally require ADMIN_SETUP_SECRET
 exports.checkAdminExists = async (req, res) => {
     try {
-        const [rows] = await db.execute("SELECT id FROM user_roles WHERE role = 'admin' LIMIT 1");
+        const [rows] = await db.execute(
+            "SELECT id FROM users WHERE role = 'admin' UNION SELECT user_id as id FROM user_roles WHERE role = 'admin' LIMIT 1"
+        );
         res.json({ hasAdmin: rows.length > 0 });
     } catch (err) {
         res.status(500).json({ error: 'Failed to check admin status.' });
@@ -143,13 +160,21 @@ exports.checkAdminExists = async (req, res) => {
 
 exports.setupFirstAdmin = async (req, res) => {
     const userId = req.user.id;
+    const setupSecret = req.body?.setupSecret || req.headers['x-admin-setup-secret'];
+
+    // C1 FIX: If ADMIN_SETUP_SECRET is configured in environment, require it
+    if (process.env.ADMIN_SETUP_SECRET && setupSecret !== process.env.ADMIN_SETUP_SECRET) {
+        return res.status(403).json({ error: 'Valid admin setup secret token is required.' });
+    }
+
     try {
-        // H3 FIX: Use atomic INSERT...SELECT to prevent race condition (TOCTOU)
+        // Atomic check across both user_roles and users to prevent race condition & privilege escalation
         const roleId = crypto.randomUUID();
         const [result] = await db.execute(
             `INSERT INTO user_roles (id, user_id, role) 
              SELECT ?, ?, 'admin' FROM DUAL 
-             WHERE NOT EXISTS (SELECT 1 FROM user_roles WHERE role = 'admin')`,
+             WHERE NOT EXISTS (SELECT 1 FROM user_roles WHERE role = 'admin')
+               AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin')`,
             [roleId, userId]
         );
 
@@ -167,17 +192,16 @@ exports.setupFirstAdmin = async (req, res) => {
 };
 
 // --- WHATSAPP OTP ---
-const otpStore = new Map(); // phone -> { code, expiresAt, attempts }
+// C6 FIX: Persistent database storage for OTPs across server restarts
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_EXPIRY_MS = 10 * 60 * 1000; // 10 minutes
 
-// C4 FIX: Auto-cleanup expired OTPs every 5 minutes to prevent memory leak
-setInterval(() => {
-    const now = Date.now();
-    for (const [phone, data] of otpStore.entries()) {
-        if (now > data.expiresAt) {
-            otpStore.delete(phone);
-        }
+// Periodic cleanup of expired OTPs from database
+setInterval(async () => {
+    try {
+        await db.execute('DELETE FROM otp_verifications WHERE expires_at < ?', [Date.now()]);
+    } catch (err) {
+        // Ignore background cleanup errors
     }
 }, 5 * 60 * 1000);
 
@@ -188,21 +212,27 @@ exports.sendWhatsAppOtp = async (req, res) => {
     }
 
     try {
-        // Generate random 6-digit code
-        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        const cleanPhone = phone_number.trim();
+        // C2 FIX: Cryptographically secure random 6-digit code (CSPRNG)
+        const code = crypto.randomInt(100000, 1000000).toString();
         const expiresAt = Date.now() + OTP_EXPIRY_MS;
+        const recordId = crypto.randomUUID();
 
-        otpStore.set(phone_number.trim(), { code, expiresAt, attempts: 0 });
+        // C6 FIX: Persist OTP in database table
+        await db.execute('DELETE FROM otp_verifications WHERE phone_number = ?', [cleanPhone]);
+        await db.execute(
+            'INSERT INTO otp_verifications (id, phone_number, code, attempts, expires_at) VALUES (?, ?, ?, 0, ?)',
+            [recordId, cleanPhone, code, expiresAt]
+        );
 
-        // C4 FIX: OTP is only logged server-side, NEVER sent in response
-        console.log(`[WhatsApp OTP] Code generated for ${phone_number.substring(0, 4)}****`);
+        console.log(`[WhatsApp OTP] Code generated for ${cleanPhone.substring(0, 4)}****`);
 
         res.json({
             success: true,
             message: 'OTP sent successfully'
-            // C4 FIX: Removed devOtp from response
         });
     } catch (err) {
+        console.error('[sendWhatsAppOtp]', err);
         res.status(500).json({ error: 'Failed to send OTP.' });
     }
 };
@@ -214,32 +244,37 @@ exports.verifyWhatsAppOtp = async (req, res) => {
     }
 
     const cleanPhone = phone_number.trim();
-    const stored = otpStore.get(cleanPhone);
-
-    if (!stored) {
-        return res.status(400).json({ error: 'No OTP requested for this number or expired' });
-    }
-
-    if (Date.now() > stored.expiresAt) {
-        otpStore.delete(cleanPhone);
-        return res.status(400).json({ error: 'OTP has expired. Please request a new code.' });
-    }
-
-    // C4 FIX: Rate limit OTP verification attempts
-    stored.attempts = (stored.attempts || 0) + 1;
-    if (stored.attempts > OTP_MAX_ATTEMPTS) {
-        otpStore.delete(cleanPhone);
-        return res.status(429).json({ error: 'Too many verification attempts. Please request a new code.' });
-    }
-
-    if (stored.code !== code.toString().trim()) {
-        return res.status(400).json({ error: 'Invalid verification code' });
-    }
-
-    // OTP verified
-    otpStore.delete(cleanPhone);
-
     try {
+        const [rows] = await db.execute(
+            'SELECT * FROM otp_verifications WHERE phone_number = ? ORDER BY created_at DESC LIMIT 1',
+            [cleanPhone]
+        );
+
+        if (rows.length === 0) {
+            return res.status(400).json({ error: 'No OTP requested for this number or expired' });
+        }
+
+        const stored = rows[0];
+
+        if (Date.now() > Number(stored.expires_at)) {
+            await db.execute('DELETE FROM otp_verifications WHERE phone_number = ?', [cleanPhone]);
+            return res.status(400).json({ error: 'OTP has expired. Please request a new code.' });
+        }
+
+        const currentAttempts = (stored.attempts || 0) + 1;
+        if (currentAttempts > OTP_MAX_ATTEMPTS) {
+            await db.execute('DELETE FROM otp_verifications WHERE phone_number = ?', [cleanPhone]);
+            return res.status(429).json({ error: 'Too many verification attempts. Please request a new code.' });
+        }
+
+        if (stored.code !== code.toString().trim()) {
+            await db.execute('UPDATE otp_verifications SET attempts = ? WHERE id = ?', [currentAttempts, stored.id]);
+            return res.status(400).json({ error: 'Invalid verification code' });
+        }
+
+        // OTP verified successfully - clear OTP record
+        await db.execute('DELETE FROM otp_verifications WHERE phone_number = ?', [cleanPhone]);
+
         // If user is authenticated, update their profile
         if (req.user?.id) {
             await db.execute('UPDATE profiles SET whatsapp_verified = 1 WHERE id = ?', [req.user.id]);
@@ -249,7 +284,9 @@ exports.verifyWhatsAppOtp = async (req, res) => {
 
         res.json({ success: true, verified: true });
     } catch (err) {
+        console.error('[verifyWhatsAppOtp]', err);
         res.status(500).json({ error: 'Verification failed.' });
     }
 };
+
 

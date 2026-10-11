@@ -41,13 +41,20 @@ exports.updateProgram = async (req, res) => {
     }
 };
 
+// M5 FIX: Check related entities before deleting program
 exports.deleteProgram = async (req, res) => {
     const { id } = req.params;
     try {
+        const [specialties] = await db.execute('SELECT id FROM specialties WHERE program_id = ? LIMIT 1', [id]);
+        if (specialties.length > 0) {
+            return res.status(400).json({ error: 'Cannot delete program: It has associated specialties. Please delete or reassign them first.' });
+        }
+        await db.execute('DELETE FROM program_pricing WHERE program_id = ?', [id]);
         await db.execute('DELETE FROM programs WHERE id = ?', [id]);
         res.json({ message: 'Program deleted successfully' });
     } catch (err) {
-        console.error(err); res.status(500).json({ error: 'Operation failed due to an internal server error.' });
+        console.error('[deleteProgram]', err);
+        res.status(500).json({ error: 'Operation failed due to an internal server error.' });
     }
 };
 
@@ -77,7 +84,7 @@ exports.createSpecialty = async (req, res) => {
         res.status(201).json({ id, name, program_id: program_id || null, description: description || null });
     } catch (err) {
         console.error('[createSpecialty]', err);
-        console.error(err); res.status(500).json({ error: 'Operation failed due to an internal server error.' });
+        res.status(500).json({ error: 'Operation failed due to an internal server error.' });
     }
 };
 
@@ -96,13 +103,19 @@ exports.updateSpecialty = async (req, res) => {
     }
 };
 
+// M5 FIX: Check related entities before deleting specialty
 exports.deleteSpecialty = async (req, res) => {
     const { id } = req.params;
     try {
+        const [cohorts] = await db.execute('SELECT id FROM cohorts WHERE specialty_id = ? LIMIT 1', [id]);
+        if (cohorts.length > 0) {
+            return res.status(400).json({ error: 'Cannot delete specialty: It has associated cohorts. Please delete or reassign them first.' });
+        }
         await db.execute('DELETE FROM specialties WHERE id = ?', [id]);
         res.json({ message: 'Specialty deleted successfully' });
     } catch (err) {
-        console.error(err); res.status(500).json({ error: 'Operation failed due to an internal server error.' });
+        console.error('[deleteSpecialty]', err);
+        res.status(500).json({ error: 'Operation failed due to an internal server error.' });
     }
 };
 
@@ -151,13 +164,23 @@ exports.updateCohort = async (req, res) => {
     }
 };
 
+// M5 FIX: Check related entities before deleting cohort
 exports.deleteCohort = async (req, res) => {
     const { id } = req.params;
     try {
+        const [students] = await db.execute('SELECT id FROM students WHERE cohort_id = ? LIMIT 1', [id]);
+        if (students.length > 0) {
+            return res.status(400).json({ error: 'Cannot delete cohort: Students are currently enrolled in it.' });
+        }
+        const [modules] = await db.execute('SELECT id FROM modules WHERE cohort_id = ? LIMIT 1', [id]);
+        if (modules.length > 0) {
+            return res.status(400).json({ error: 'Cannot delete cohort: It contains associated modules.' });
+        }
         await db.execute('DELETE FROM cohorts WHERE id = ?', [id]);
         res.json({ message: 'Cohort deleted successfully' });
     } catch (err) {
-        console.error(err); res.status(500).json({ error: 'Operation failed due to an internal server error.' });
+        console.error('[deleteCohort]', err);
+        res.status(500).json({ error: 'Operation failed due to an internal server error.' });
     }
 };
 
@@ -296,13 +319,23 @@ exports.updateModule = async (req, res) => {
     }
 };
 
+// M5 FIX: Check related entities before deleting module
 exports.deleteModule = async (req, res) => {
     const { id } = req.params;
     try {
+        const [lessons] = await db.execute('SELECT id FROM lessons WHERE module_id = ? LIMIT 1', [id]);
+        if (lessons.length > 0) {
+            return res.status(400).json({ error: 'Cannot delete module: It has active lessons.' });
+        }
+        const [assignments] = await db.execute('SELECT id FROM assignments WHERE module_id = ? LIMIT 1', [id]);
+        if (assignments.length > 0) {
+            return res.status(400).json({ error: 'Cannot delete module: It has active assignments.' });
+        }
         await db.execute('DELETE FROM modules WHERE id = ?', [id]);
         res.json({ message: 'Module deleted successfully' });
     } catch (err) {
-        console.error(err); res.status(500).json({ error: 'Operation failed due to an internal server error.' });
+        console.error('[deleteModule]', err);
+        res.status(500).json({ error: 'Operation failed due to an internal server error.' });
     }
 };
 
@@ -395,6 +428,22 @@ exports.getStudentDetails = async (req, res) => {
         const student = studentRows[0];
         const studentId = student.id;
         const userId = student.user_id;
+
+        // H7 FIX: Teachers can only view details of students belonging to their assigned cohorts
+        if (req.user.role === 'teacher') {
+            if (!student.cohort_id) {
+                return res.status(403).json({ error: 'You do not have permission to view this student profile.' });
+            }
+            const [teachesCohort] = await db.execute(`
+                SELECT 1 FROM modules m
+                JOIN teachers t ON m.teacher_id = t.id
+                WHERE t.user_id = ? AND m.cohort_id = ?
+                LIMIT 1
+            `, [req.user.id, student.cohort_id]);
+            if (teachesCohort.length === 0) {
+                return res.status(403).json({ error: 'You do not have permission to view details of students outside your assigned cohorts.' });
+            }
+        }
 
         // 2. Placement Test & Level Evaluation
         const [testRows] = await db.execute(`

@@ -20,8 +20,12 @@ exports.upsertPricing = async (req, res) => {
     const { program_id, price, currency, is_active } = req.body;
     try {
         const numPrice = parseFloat(price);
-        if (isNaN(numPrice) || numPrice < 0) {
-            return res.status(400).json({ error: 'Valid price is required' });
+        // M3 FIX: Ensure program price is strictly positive
+        if (isNaN(numPrice) || numPrice <= 0) {
+            return res.status(400).json({ error: 'Price must be a positive number greater than zero' });
+        }
+        if (!program_id) {
+            return res.status(400).json({ error: 'Valid program_id is required' });
         }
 
         await db.execute(
@@ -79,39 +83,52 @@ exports.getAllPayments = async (req, res) => {
     }
 };
 
+// C4 & H1 FIX: Require valid programId, verify amount against real pricing, remove arbitrary fallback
 exports.submitPayment = async (req, res) => {
     const { programId, amount, referenceNumber, notes, receiptUrl } = req.body;
+    
+    // M12 FIX: Validate amount is a positive number
+    const numAmount = parseFloat(amount);
+    if (isNaN(numAmount) || numAmount <= 0) {
+        return res.status(400).json({ error: 'Payment amount must be greater than zero' });
+    }
+
+    if (!programId) {
+        return res.status(400).json({ error: 'A valid programId is required to submit a payment' });
+    }
+
+    const conn = await db.getConnection();
     try {
-        // M12 FIX: Validate amount is a positive number
-        const numAmount = parseFloat(amount);
-        if (isNaN(numAmount) || numAmount <= 0) {
-            return res.status(400).json({ error: 'Payment amount must be greater than zero' });
+        // C4 FIX: Verify program exists
+        const [progRows] = await conn.execute('SELECT id, name FROM programs WHERE id = ?', [programId]);
+        if (progRows.length === 0) {
+            conn.release();
+            return res.status(400).json({ error: 'Selected program does not exist' });
+        }
+        const validProgramId = progRows[0].id;
+
+        // H1 FIX: Verify real program price from program_pricing
+        const [pricingRows] = await conn.execute('SELECT price, currency FROM program_pricing WHERE program_id = ? AND is_active = 1', [validProgramId]);
+        if (pricingRows.length > 0) {
+            const officialPrice = parseFloat(pricingRows[0].price);
+            if (!isNaN(officialPrice) && officialPrice > 0 && numAmount < officialPrice) {
+                conn.release();
+                return res.status(400).json({ error: `Payment amount (${numAmount}) cannot be less than program price (${officialPrice})` });
+            }
         }
 
-        const [student] = await db.execute('SELECT id FROM students WHERE user_id = ? OR id = ?', [req.user.id, req.user.id]);
+        await conn.beginTransaction();
+
+        const [student] = await conn.execute('SELECT id FROM students WHERE user_id = ? OR id = ?', [req.user.id, req.user.id]);
         let studentId;
         if (student.length === 0) {
             studentId = crypto.randomUUID();
-            await db.execute(
+            await conn.execute(
                 'INSERT INTO students (id, user_id, status, enrollment_date) VALUES (?, ?, ?, NOW())',
                 [studentId, req.user.id, 'active']
             );
         } else {
             studentId = student[0].id;
-        }
-
-        let validProgramId = null;
-        if (programId) {
-            const [progRows] = await db.execute('SELECT id FROM programs WHERE id = ?', [programId]);
-            if (progRows.length > 0) {
-                validProgramId = progRows[0].id;
-            }
-        }
-        if (!validProgramId) {
-            const [firstProg] = await db.execute('SELECT id FROM programs LIMIT 1');
-            if (firstProg.length > 0) {
-                validProgramId = firstProg[0].id;
-            }
         }
 
         // Sanitize receipt_url
@@ -123,14 +140,19 @@ exports.submitPayment = async (req, res) => {
         }
 
         const id = crypto.randomUUID();
-        await db.execute(
+        await conn.execute(
             'INSERT INTO payments (id, student_id, program_id, amount, payment_method, reference_number, notes, receipt_url, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             [id, studentId, validProgramId, numAmount, 'manual', referenceNumber || '', notes || '', safeReceiptUrl, 'pending']
         );
+
+        await conn.commit();
         res.status(201).json({ id, status: 'pending' });
     } catch (err) {
+        await conn.rollback();
         console.error('[submitPayment error]', err);
         res.status(500).json({ error: 'Failed to submit payment' });
+    } finally {
+        conn.release();
     }
 };
 

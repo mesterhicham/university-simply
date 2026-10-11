@@ -18,8 +18,25 @@ exports.getProfile = async (req, res) => {
     }
 };
 
+// M6 FIX: Sanitize avatar_url to prevent XSS via javascript: or data: URIs
 exports.updateProfile = async (req, res) => {
     const { full_name, phone, address, city, country, bio, date_of_birth, avatar_url } = req.body;
+
+    let sanitizedAvatarUrl = null;
+    if (avatar_url !== undefined && avatar_url !== null) {
+        if (typeof avatar_url !== 'string') {
+            return res.status(400).json({ error: 'Invalid avatar_url format' });
+        }
+        const trimmed = avatar_url.trim();
+        if (trimmed.length > 0) {
+            if (/^(https?:\/\/|\/uploads\/)/i.test(trimmed) && !/^(javascript|data|vbscript):/i.test(trimmed)) {
+                sanitizedAvatarUrl = trimmed;
+            } else {
+                return res.status(400).json({ error: 'Avatar URL must be a valid http(s) URL or relative /uploads/ path' });
+            }
+        }
+    }
+
     try {
         await db.execute(
             `UPDATE profiles SET 
@@ -34,7 +51,7 @@ exports.updateProfile = async (req, res) => {
                 country ?? null,
                 bio ?? null,
                 date_of_birth ?? null,
-                avatar_url ?? null,
+                sanitizedAvatarUrl,
                 req.user.id
             ]
         );

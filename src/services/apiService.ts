@@ -10,7 +10,7 @@ export const authService = {
 export const userService = {
     getProfile: () => api.get('/user/profile').then(res => res.data),
     updateProfile: (data: any) => api.put('/user/profile', data).then(res => res.data),
-    deleteAccount: () => api.delete('/user/account').then(res => res.data),
+    deleteAccount: (password: string) => api.delete('/user/account', { data: { password } }).then(res => res.data),
     changePassword: (data: any) => api.post('/user/change-password', data).then(res => res.data),
     getStats: (role: string) => api.get(`/user/stats/${role}`).then(res => res.data),
     getAdminStats: () => api.get('/user/stats/admin').then(res => res.data),
