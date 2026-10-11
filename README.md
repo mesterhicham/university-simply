@@ -1,73 +1,83 @@
-# Welcome to your Lovable project
+# 🎓 Simply University (أكاديمية سيمبلي التعليمية)
 
-## Project info
+منصة تعليمية ذكية متكاملة لإدارة البرامج الأكاديمية، الأساتذة، الطلاب، المدفوعات، والفصول الافتراضية.
 
-**URL**: https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID
+---
 
-## How can I edit this code?
+## 🌟 مميزات المنصة
 
-There are several ways of editing your application.
+- **لوحة تحكم إدارية شاملة (Admin Dashboard):**
+  - إدارة البرامج الأكاديمية والتخصصات والأفواج (Cohorts).
+  - إدارة حسابات الأساتذة والطلاب والموافقة على التسجيلات.
+  - متابعة المدفوعات والاشتراكات.
+  - إعدادات المنصة المتقدمة (Platform Settings) وقوالب البريد الإلكتروني.
+  - إدارة امتحانات تحديد المستوى وإصدار الشهادات الأكاديمية (Diplomas).
 
-**Use Lovable**
+- **بوابة الأستاذ (Teacher Portal):**
+  - إدارة الدروس، الوحدات، والواجبات المنزلية.
+  - متابعة الحضور والغياب للطلاب.
+  - تقييم أداء الطلاب ومتابعة تقدمهم الأكاديمي.
+  - غرف اجتماعات وفصول افتراضية عبر Zoom.
 
-Simply visit the [Lovable Project](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and start prompting.
+- **بوابة الطالب (Student Portal):**
+  - متابعة المقررات الدراسية، الدروس المسجلة، والواجبات.
+  - إجراء امتحانات تحديد المستوى والاختبارات التفاعلية.
+  - الدفع الإلكتروني ومتابعة الفواتير.
+  - الدردشة التفاعلية مع الأساتذة والدعم الفني.
+  - استعراض وتحميل الشهادات والنتائج.
 
-Changes made via Lovable will be committed automatically to this repo.
+---
 
-**Use your preferred IDE**
+## 🛠 التقنيات المستخدمة (Tech Stack)
 
-If you want to work locally using your own IDE, you can clone this repo and push changes. Pushed changes will also be reflected in Lovable.
+- **Frontend:** React 18, TypeScript, Vite, Tailwind CSS, Radix UI / Shadcn UI, React Router.
+- **Backend:** Node.js, Express.js, JWT Authentication, Helmet, Rate Limiter.
+- **Database:** MySQL.
+- **Deployment:** Vercel (Frontend) & Node.js / VPS / cPanel (Backend).
 
-The only requirement is having Node.js & npm installed - [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating)
+---
 
-Follow these steps:
+## 🚀 التثبيت والتشغيل المحلي (Local Setup)
 
-```sh
-# Step 1: Clone the repository using the project's Git URL.
-git clone <YOUR_GIT_URL>
+### 1. المتطلبات:
+* [Node.js](https://nodejs.org/) (إصدار 18 أو أحدث)
+* سيرفر MySQL محلي (مثل MAMP أو XAMPP)
 
-# Step 2: Navigate to the project directory.
-cd <YOUR_PROJECT_NAME>
+### 2. تجهيز قاعدة البيانات:
+1. قم بإنشاء قاعدة بيانات MySQL جديدة باسم `academyelofoq` أو `simplyuniversity`.
+2. استورد ملف `mysql_schema.sql` المرفق في المشروع.
 
-# Step 3: Install the necessary dependencies.
-npm i
-
-# Step 4: Start the development server with auto-reloading and an instant preview.
-npm run dev
+### 3. تشغيل النظام الخلفي (Backend):
+```bash
+cd backend
+npm install
+# قم بإنشاء ملف .env بناءً على .env.example
+npm start
 ```
 
-**Edit a file directly in GitHub**
+### 4. تشغيل الواجهة الأمامية (Frontend):
+```bash
+# من المجلد الرئيسي للمشروع
+npm install
+npm run dev
+```
+سيعمل الموقع محلياً على: `http://localhost:8080`
 
-- Navigate to the desired file(s).
-- Click the "Edit" button (pencil icon) at the top right of the file view.
-- Make your changes and commit the changes.
+---
 
-**Use GitHub Codespaces**
+## 🔑 بيانات الدخول الافتراضية للمدير (Super Admin)
 
-- Navigate to the main page of your repository.
-- Click on the "Code" button (green button) near the top right.
-- Select the "Codespaces" tab.
-- Click on "New codespace" to launch a new Codespace environment.
-- Edit files directly within the Codespace and commit and push your changes once you're done.
+* **الرابط:** `/auth` أو `/login`
+* **البريد الإلكتروني:** `admin@academy.com`
+* **كلمة المرور:** `Admin123!`
 
-## What technologies are used for this project?
+---
 
-This project is built with:
+## 📖 دليل النشر على السيرفر (Production Deployment)
 
-- Vite
-- TypeScript
-- React
-- shadcn-ui
-- Tailwind CSS
+للحصول على شرح تفصيلي خطوة بخطوة لرفع المشروع وقاعدة البيانات على السيرفرات السحابية (Hostinger / VPS / cPanel)، يرجى مراجعة ملف [`DEPLOYMENT.md`](./DEPLOYMENT.md).
 
-## How can I deploy this project?
+---
 
-Simply open [Lovable](https://lovable.dev/projects/REPLACE_WITH_PROJECT_ID) and click on Share -> Publish.
-
-## Can I connect a custom domain to my Lovable project?
-
-Yes, you can!
-
-To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
-
-Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+## 📄 الترخيص (License)
+جميع الحقوق محفوظة © Simply University.
