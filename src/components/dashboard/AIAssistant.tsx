@@ -18,7 +18,7 @@ interface AIAssistantProps {
   role: UserRole;
 }
 
-const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ai-assistant`;
+const CHAT_URL = import.meta.env.VITE_AI_CHAT_URL || (import.meta.env.VITE_SUPABASE_URL ? `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ai-assistant` : '');
 const STORAGE_KEY_PREFIX = 'ai-assistant-history-';
 
 export function AIAssistant({ role }: AIAssistantProps) {
@@ -65,11 +65,16 @@ export function AIAssistant({ role }: AIAssistantProps) {
   }, [isOpen, isMinimized]);
 
   const streamChat = async (userMessages: Message[]) => {
+    if (!CHAT_URL) {
+      throw new Error('خدمة المساعد الذكي غير مهيأة حالياً على الخادم.');
+    }
+
+    const token = localStorage.getItem('token') || '';
     const resp = await fetch(CHAT_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify({ messages: userMessages, role }),
     });
