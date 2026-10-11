@@ -18,7 +18,7 @@ interface AIAssistantProps {
   role: UserRole;
 }
 
-const CHAT_URL = import.meta.env.VITE_AI_CHAT_URL || (import.meta.env.VITE_SUPABASE_URL ? `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ai-assistant` : '');
+const CHAT_URL = import.meta.env.VITE_AI_CHAT_URL || '';
 const STORAGE_KEY_PREFIX = 'ai-assistant-history-';
 
 export function AIAssistant({ role }: AIAssistantProps) {
