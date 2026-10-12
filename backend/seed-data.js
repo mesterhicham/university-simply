@@ -30,7 +30,8 @@ async function seed() {
         } else {
             const adminId = crypto.randomUUID();
             const adminEmail = process.env.INITIAL_ADMIN_EMAIL || 'admin@academy.local';
-            const adminPassword = process.env.INITIAL_ADMIN_PASSWORD || 'Admin123!';
+            const generatedPassword = `Admin-${crypto.randomBytes(8).toString('hex')}!`;
+            const adminPassword = process.env.INITIAL_ADMIN_PASSWORD || generatedPassword;
             const hashedPassword = await bcrypt.hash(adminPassword, 12);
 
             await pool.query(
