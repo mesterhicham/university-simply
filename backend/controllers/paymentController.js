@@ -83,23 +83,30 @@ exports.getAllPayments = async (req, res) => {
     }
 };
 
-// C4 & H1 FIX: Require valid programId, verify amount against real pricing, remove arbitrary fallback
+// C4 & H1 FIX: Require valid programId, verify amount against real pricing, enforce idempotency
 exports.submitPayment = async (req, res) => {
     const { programId, amount, referenceNumber, notes, receiptUrl } = req.body;
     
-    // M12 FIX: Validate amount is a positive number
-    const numAmount = parseFloat(amount);
+    // Strict amount validation: reject non-numeric strings, negative values, zero, or invalid formats
+    if (amount === undefined || amount === null || typeof amount === 'boolean') {
+        return res.status(400).json({ error: 'Valid payment amount is required' });
+    }
+    const strAmount = String(amount).trim();
+    if (!/^\d+(\.\d{1,2})?$/.test(strAmount)) {
+        return res.status(400).json({ error: 'Payment amount must be a valid positive numerical value' });
+    }
+    const numAmount = Number(strAmount);
     if (isNaN(numAmount) || numAmount <= 0) {
         return res.status(400).json({ error: 'Payment amount must be greater than zero' });
     }
 
-    if (!programId) {
+    if (!programId || typeof programId !== 'string') {
         return res.status(400).json({ error: 'A valid programId is required to submit a payment' });
     }
 
     const conn = await db.getConnection();
     try {
-        // C4 FIX: Verify program exists
+        // Verify program exists
         const [progRows] = await conn.execute('SELECT id, name FROM programs WHERE id = ?', [programId]);
         if (progRows.length === 0) {
             conn.release();
@@ -107,14 +114,24 @@ exports.submitPayment = async (req, res) => {
         }
         const validProgramId = progRows[0].id;
 
-        // H1 FIX: Verify real program price from program_pricing
-        const [pricingRows] = await conn.execute('SELECT price, currency FROM program_pricing WHERE program_id = ? AND is_active = 1', [validProgramId]);
-        if (pricingRows.length > 0) {
-            const officialPrice = parseFloat(pricingRows[0].price);
-            if (!isNaN(officialPrice) && officialPrice > 0 && numAmount < officialPrice) {
-                conn.release();
-                return res.status(400).json({ error: `Payment amount (${numAmount}) cannot be less than program price (${officialPrice})` });
-            }
+        // Phase 3 Requirement: Reject if program has no active, valid price in program_pricing
+        const [pricingRows] = await conn.execute(
+            'SELECT price, currency, is_active FROM program_pricing WHERE program_id = ? AND is_active = 1',
+            [validProgramId]
+        );
+        if (pricingRows.length === 0) {
+            conn.release();
+            return res.status(400).json({ error: 'Selected program does not have an active and valid official price configured.' });
+        }
+        const officialPrice = parseFloat(pricingRows[0].price);
+        if (isNaN(officialPrice) || officialPrice <= 0) {
+            conn.release();
+            return res.status(400).json({ error: 'Program price is invalid in the system.' });
+        }
+        const currency = pricingRows[0].currency || 'USD';
+        if (numAmount < officialPrice) {
+            conn.release();
+            return res.status(400).json({ error: `Payment amount (${numAmount}) cannot be less than program price (${officialPrice} ${currency})` });
         }
 
         await conn.beginTransaction();
@@ -131,10 +148,35 @@ exports.submitPayment = async (req, res) => {
             studentId = student[0].id;
         }
 
+        // Idempotency: Prevent duplicate pending payment submissions for the same program
+        const [existingPending] = await conn.execute(
+            'SELECT id FROM payments WHERE student_id = ? AND program_id = ? AND status = "pending"',
+            [studentId, validProgramId]
+        );
+        if (existingPending.length > 0) {
+            await conn.rollback();
+            conn.release();
+            return res.status(409).json({ error: 'You already have a pending payment submitted for this program awaiting review.' });
+        }
+
+        // Check reference number uniqueness if provided
+        const cleanRef = (referenceNumber && typeof referenceNumber === 'string') ? referenceNumber.trim() : '';
+        if (cleanRef) {
+            const [refRows] = await conn.execute(
+                'SELECT id FROM payments WHERE reference_number = ? AND status != "rejected"',
+                [cleanRef]
+            );
+            if (refRows.length > 0) {
+                await conn.rollback();
+                conn.release();
+                return res.status(409).json({ error: 'This payment reference number has already been submitted.' });
+            }
+        }
+
         // Sanitize receipt_url
         let safeReceiptUrl = '';
         if (receiptUrl && typeof receiptUrl === 'string') {
-            if (receiptUrl.startsWith('http://') || receiptUrl.startsWith('https://') || receiptUrl.startsWith('/uploads/')) {
+            if (receiptUrl.startsWith('http://') || receiptUrl.startsWith('https://') || receiptUrl.startsWith('/uploads/') || receiptUrl.startsWith('/private-uploads/')) {
                 safeReceiptUrl = receiptUrl;
             }
         }
@@ -142,11 +184,11 @@ exports.submitPayment = async (req, res) => {
         const id = crypto.randomUUID();
         await conn.execute(
             'INSERT INTO payments (id, student_id, program_id, amount, payment_method, reference_number, notes, receipt_url, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [id, studentId, validProgramId, numAmount, 'manual', referenceNumber || '', notes || '', safeReceiptUrl, 'pending']
+            [id, studentId, validProgramId, numAmount, 'manual', cleanRef, notes ? String(notes).trim() : '', safeReceiptUrl, 'pending']
         );
 
         await conn.commit();
-        res.status(201).json({ id, status: 'pending' });
+        res.status(201).json({ id, status: 'pending', amount: numAmount, currency });
     } catch (err) {
         await conn.rollback();
         console.error('[submitPayment error]', err);
@@ -159,19 +201,47 @@ exports.submitPayment = async (req, res) => {
 exports.updatePaymentStatus = async (req, res) => {
     const { id } = req.params;
     const { status, adminNotes } = req.body;
+    const allowedStatuses = ['approved', 'rejected'];
+    if (!allowedStatuses.includes(status)) {
+        return res.status(400).json({ error: 'Invalid status. Allowed statuses are: approved, rejected' });
+    }
+
+    const conn = await db.getConnection();
     try {
-        const allowedStatuses = ['pending', 'approved', 'rejected'];
-        if (!allowedStatuses.includes(status)) {
-            return res.status(400).json({ error: 'Invalid status' });
+        await conn.beginTransaction();
+
+        const [rows] = await conn.execute(
+            'SELECT id, student_id, program_id, status FROM payments WHERE id = ? FOR UPDATE',
+            [id]
+        );
+        if (rows.length === 0) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Payment not found' });
         }
 
-        await db.execute(
+        const currentPayment = rows[0];
+        if (currentPayment.status === 'approved') {
+            await conn.rollback();
+            return res.status(400).json({ error: 'Payment has already been approved and cannot be modified further.' });
+        }
+
+        await conn.execute(
             'UPDATE payments SET status = ?, admin_notes = ?, reviewed_by = ?, reviewed_at = NOW(), updated_at = NOW() WHERE id = ?',
-            [status, adminNotes || '', req.user.id, id]
+            [status, adminNotes ? String(adminNotes).trim() : '', req.user.id, id]
         );
-        res.json({ id, status });
+
+        // If approved, ensure student account is active
+        if (status === 'approved') {
+            await conn.execute('UPDATE students SET status = "active" WHERE id = ?', [currentPayment.student_id]);
+        }
+
+        await conn.commit();
+        res.json({ id, status, previousStatus: currentPayment.status });
     } catch (err) {
+        await conn.rollback();
         console.error('[updatePaymentStatus error]', err);
         res.status(500).json({ error: 'Failed to update payment status' });
+    } finally {
+        conn.release();
     }
 };

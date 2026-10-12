@@ -19,18 +19,22 @@ const chatRoutes = require('./routes/chat');
 dotenv.config();
 const db = require('./config/db');
 
-// Ensure otp_verifications table exists
+// Ensure otp_verifications table exists and has wide column for SHA-256 code hash
 db.execute(`
     CREATE TABLE IF NOT EXISTS otp_verifications (
         id VARCHAR(36) PRIMARY KEY,
         phone_number VARCHAR(50) NOT NULL,
-        code VARCHAR(10) NOT NULL,
+        code VARCHAR(128) NOT NULL,
         attempts INT DEFAULT 0,
         expires_at BIGINT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_phone (phone_number)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-`).catch(err => console.warn('[DB Init] OTP table check warning:', err.message));
+`).then(async () => {
+    try {
+        await db.execute('ALTER TABLE otp_verifications MODIFY COLUMN code VARCHAR(128) NOT NULL;');
+    } catch (_) {}
+}).catch(err => console.warn('[DB Init] OTP table check warning:', err.message));
 
 const app = express();
 const PORT = process.env.PORT || 5000;

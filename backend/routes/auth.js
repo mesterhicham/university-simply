@@ -13,6 +13,8 @@ router.post('/setup-admin', auth, authController.setupFirstAdmin);
 
 // WhatsApp OTP
 router.post('/whatsapp/send-otp', authController.sendWhatsAppOtp);
+router.post('/whatsapp/send', authController.sendWhatsAppOtp);
 router.post('/whatsapp/verify-otp', authController.verifyWhatsAppOtp);
+router.post('/whatsapp/verify', authController.verifyWhatsAppOtp);
 
 module.exports = router;

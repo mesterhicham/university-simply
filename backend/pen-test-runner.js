@@ -91,8 +91,9 @@ async function setupFixtures() {
     console.log(`\n${CYAN}>>> Setting up test fixtures in MySQL database...${RESET}`);
     const hash = await bcrypt.hash('Password123!', 8);
 
-    // Create Program, Specialty, Cohorts
+    // Create Program, Specialty, Cohorts, and Active Pricing
     await db.execute('INSERT INTO programs (id, name, description, duration) VALUES (?, ?, ?, ?)', [FIXTURES.program.id, FIXTURES.program.name, 'Test', '1 year']);
+    await db.execute('INSERT INTO program_pricing (id, program_id, price, currency, is_active) VALUES (?, ?, 250.00, "USD", 1)', [crypto.randomUUID(), FIXTURES.program.id]);
     await db.execute('INSERT INTO specialties (id, name, program_id) VALUES (?, ?, ?)', [FIXTURES.specialty.id, FIXTURES.specialty.name, FIXTURES.program.id]);
     await db.execute('INSERT INTO cohorts (id, name, specialty_id) VALUES (?, ?, ?)', [FIXTURES.cohortA.id, FIXTURES.cohortA.name, FIXTURES.specialty.id]);
     await db.execute('INSERT INTO cohorts (id, name, specialty_id) VALUES (?, ?, ?)', [FIXTURES.cohortB.id, FIXTURES.cohortB.name, FIXTURES.specialty.id]);
@@ -198,6 +199,7 @@ async function teardownFixtures() {
         await db.execute('DELETE FROM modules WHERE id = ?', [FIXTURES.moduleA.id]);
         await db.execute('DELETE FROM cohorts WHERE id IN (?, ?)', [FIXTURES.cohortA.id, FIXTURES.cohortB.id]);
         await db.execute('DELETE FROM specialties WHERE id = ?', [FIXTURES.specialty.id]);
+        await db.execute('DELETE FROM program_pricing WHERE program_id = ?', [FIXTURES.program.id]);
         await db.execute('DELETE FROM programs WHERE id = ?', [FIXTURES.program.id]);
         console.log(`${GREEN}>>> Cleanup completed.${RESET}\n`);
     } catch (e) {
@@ -652,13 +654,13 @@ async function runPenetrationSuite() {
         const p2 = request('POST', '/api/auth/setup-admin', null, tokens.studentB);
         const [r1, r2] = await Promise.all([p1, p2]);
 
-        // Since an admin already exists in the system, BOTH must fail with 400
-        const pass = (r1.status === 400 && r1.data.error.includes('already exists')) &&
-                     (r2.status === 400 && r2.data.error.includes('already exists'));
+        // Since an admin already exists in the system, BOTH must be rejected with 400 or 403 Forbidden
+        const pass = ([400, 403].includes(r1.status) && r1.data.error.includes('already exists')) &&
+                     ([400, 403].includes(r2.status) && r2.data.error.includes('already exists'));
 
         recordResult('Race Condition', 'Concurrent First Admin Setup', '/api/auth/setup-admin',
             'Two users simultaneously execute setup-admin to hijack the admin role',
-            'Atomic query prevents any race condition; rejects both with 400',
+            'Atomic query prevents any race condition; rejects both with 400 or 403',
             `Req1: ${r1.status}, Req2: ${r2.status}`,
             pass, 'CRITICAL');
     }
@@ -721,7 +723,197 @@ async function runPenetrationSuite() {
             pass, 'HIGH');
     }
 
-    console.log(`\n${CYAN}========================================================================${RESET}`);
+    // ─── 9. ADVANCED PAYMENT & IDEMPOTENCY HARDENING ─────────────────────────────
+    console.log(`\n${YELLOW}[CATEGORY 9: Payments & Idempotency Hardening]${RESET}`);
+
+    // Test 9.1: Non-numeric amount string injection (100abc)
+    {
+        const res = await request('POST', '/api/payment/submit', {
+            programId: FIXTURES.program.id,
+            amount: '100abc'
+        }, tokens.studentA);
+
+        const pass = res.status === 400 && res.data.error.includes('valid positive numerical');
+        recordResult('Payments', 'Reject non-numeric payment amounts (100abc)', '/api/payment/submit',
+            'Attacker supplies string amount containing letters',
+            'Server rejects with 400 and requires valid positive numerical value',
+            `Status: ${res.status} (${JSON.stringify(res.data)})`,
+            pass, 'HIGH');
+    }
+
+    // Test 9.2: Negative and zero payment amounts
+    {
+        const rNeg = await request('POST', '/api/payment/submit', {
+            programId: FIXTURES.program.id,
+            amount: -50
+        }, tokens.studentA);
+
+        const rZero = await request('POST', '/api/payment/submit', {
+            programId: FIXTURES.program.id,
+            amount: 0
+        }, tokens.studentA);
+
+        const pass = rNeg.status === 400 && rZero.status === 400;
+        recordResult('Payments', 'Reject negative or zero payment amounts', '/api/payment/submit',
+            'User attempts to submit -50 or 0 payment',
+            'Server rejects negative and zero amounts with 400',
+            `Negative status: ${rNeg.status}, Zero status: ${rZero.status}`,
+            pass, 'HIGH');
+    }
+
+    // Test 9.3: Reject payment submission for program without active official pricing
+    {
+        const unpricedProgId = crypto.randomUUID();
+        await db.execute('INSERT INTO programs (id, name, description, duration) VALUES (?, "Unpriced Course", "Test", "1m")', [unpricedProgId]);
+
+        const res = await request('POST', '/api/payment/submit', {
+            programId: unpricedProgId,
+            amount: 100
+        }, tokens.studentA);
+
+        await db.execute('DELETE FROM programs WHERE id = ?', [unpricedProgId]);
+
+        const pass = res.status === 400 && res.data.error.includes('official price configured');
+        recordResult('Payments', 'Reject payment when program has no active price', '/api/payment/submit',
+            'Student submits payment for program without configured active pricing',
+            'Server verifies active pricing in database and rejects with 400',
+            `Status: ${res.status} (${JSON.stringify(res.data)})`,
+            pass, 'HIGH');
+    }
+
+    // Test 9.4: Duplicate payment submission blocked by Idempotency
+    {
+        // Student B submits valid payment for FIXTURES.program.id
+        const p1 = await request('POST', '/api/payment/submit', {
+            programId: FIXTURES.program.id,
+            amount: 250,
+            referenceNumber: 'REF-IDEMPOTENT-001'
+        }, tokens.studentB);
+
+        // Immediate duplicate submission with same program and reference number
+        const p2 = await request('POST', '/api/payment/submit', {
+            programId: FIXTURES.program.id,
+            amount: 250,
+            referenceNumber: 'REF-IDEMPOTENT-001'
+        }, tokens.studentB);
+
+        const pass = p1.status === 201 && p2.status === 409;
+        recordResult('Payments', 'Duplicate payment request blocked by Idempotency (409)', '/api/payment/submit',
+            'Student double-submits payment for same program while previous is pending',
+            'Server rejects duplicate submission with 409 Conflict',
+            `First submission: ${p1.status}, Duplicate submission: ${p2.status}`,
+            pass, 'HIGH');
+
+        if (p1.data?.id) await db.execute('DELETE FROM payments WHERE id = ?', [p1.data.id]);
+    }
+
+    // Test 9.5: Student or Teacher modifying payment status
+    {
+        const rStudent = await request('PUT', `/api/payment/${FIXTURES.paymentA.id}/status`, { status: 'approved' }, tokens.studentA);
+        const rTeacher = await request('PUT', `/api/payment/${FIXTURES.paymentA.id}/status`, { status: 'approved' }, tokens.teacherA);
+
+        const pass = rStudent.status === 403 && rTeacher.status === 403;
+        recordResult('Payments', 'Disallow students/teachers modifying payment status', '/api/payment/:id/status',
+            'Student or teacher attempts to call payment status update endpoint',
+            'Server denies access with 403 Forbidden',
+            `Student status: ${rStudent.status}, Teacher status: ${rTeacher.status}`,
+            pass, 'CRITICAL');
+    }
+
+    // ─── 10. PRIVATE UPLOADS & FILE ACCESS CONTROLS ─────────────────────────────
+    console.log(`\n${YELLOW}[CATEGORY 10: Private Uploads & File Access Control]${RESET}`);
+
+    // Test 10.1: Student B attempting to access Student A's private document
+    {
+        const fs = require('fs');
+        const path = require('path');
+        const privateDir = path.join(__dirname, 'private_uploads');
+        if (!fs.existsSync(privateDir)) fs.mkdirSync(privateDir, { recursive: true });
+
+        const testDocName = `receipt-${crypto.randomUUID()}.pdf`;
+        const testDocPath = path.join(privateDir, testDocName);
+        fs.writeFileSync(testDocPath, '%PDF-1.4 test private student document');
+
+        // Link document to Student A's payment
+        await db.execute('UPDATE payments SET receipt_url = ? WHERE id = ?', [`/api/upload/private/${testDocName}`, FIXTURES.paymentA.id]);
+
+        // Student B tries to download it
+        const resB = await request('GET', `/api/upload/private/${testDocName}`, null, tokens.studentB);
+
+        // Student A (owner) tries to download it
+        const resA = await request('GET', `/api/upload/private/${testDocName}`, null, tokens.studentA);
+
+        try { fs.unlinkSync(testDocPath); } catch (_) {}
+
+        const pass = resB.status === 403 && resA.status === 200;
+        recordResult('File Privacy', 'Cross-Student Private Document Isolation', '/api/upload/private/:filename',
+            'Student B tries to download private receipt belonging to Student A',
+            'Student B is blocked with 403 Forbidden; Owner Student A receives 200',
+            `Student B: ${resB.status}, Student A: ${resA.status}`,
+            pass, 'CRITICAL');
+    }
+
+    // ─── 11. SCHOOL RBAC & SETTINGS SEGREGATION ──────────────────────────────────
+    console.log(`\n${YELLOW}[CATEGORY 11: School RBAC & Settings Segregation]${RESET}`);
+
+    // Test 11.1: Student calling GET /api/admin/settings
+    {
+        const res = await request('GET', '/api/admin/settings', null, tokens.studentA);
+        const pass = res.status === 403;
+        recordResult('School RBAC', 'Protect GET /api/admin/settings from non-admin access', '/api/admin/settings',
+            'Student attempts to view complete platform administrative settings',
+            'Server denies access with 403 Forbidden',
+            `Status: ${res.status}`,
+            pass, 'CRITICAL');
+    }
+
+    // Test 11.2: General user calling GET /api/admin/public-settings
+    {
+        const res = await request('GET', '/api/admin/public-settings', null, tokens.studentA);
+        const isArray = Array.isArray(res.data);
+        const hasNoSecrets = isArray && !res.data.some(s => s.key === 'smtp_password' || s.key === 'jwt_secret');
+        const pass = res.status === 200 && isArray && hasNoSecrets;
+        recordResult('School RBAC', 'Public settings endpoint provides only sanitized metadata', '/api/admin/public-settings',
+            'Student retrieves public branding settings',
+            'Server returns 200 with sanitized non-sensitive visual keys only',
+            `Status: ${res.status}, Sanitized: ${hasNoSecrets}`,
+            pass, 'HIGH');
+    }
+
+    // ─── 12. ACCOUNT SUSPENSION & WHATSAPP OTP HARDENING ─────────────────────────
+    console.log(`\n${YELLOW}[CATEGORY 12: Account Suspension & WhatsApp OTP Hardening]${RESET}`);
+
+    // Test 12.1: Suspended student blocked on authenticated API calls
+    {
+        const res = await request('GET', '/api/academic/programs', null, tokens.suspendedStudent);
+        const pass = res.status === 403 && res.data.error.includes('suspended');
+        recordResult('Authentication', 'Suspended account token rejected on API access', '/api/academic/programs',
+            'User suspended after login attempts API call with valid JWT',
+            'Server queries live status, detects suspension, and returns 403',
+            `Status: ${res.status} (${JSON.stringify(res.data)})`,
+            pass, 'CRITICAL');
+    }
+
+    // Test 12.2: WhatsApp OTP Code stored as SHA-256 hash in database
+    {
+        const testPhone = '+15559998877';
+        const res = await request('POST', '/api/auth/whatsapp/send', {
+            phone_number: testPhone
+        });
+
+        const [rows] = await db.execute('SELECT code FROM otp_verifications WHERE phone_number = ?', [testPhone]);
+        await db.execute('DELETE FROM otp_verifications WHERE phone_number = ?', [testPhone]);
+
+        // Hash must be 64 characters (SHA-256 hex) and not a 6-digit plain number
+        const isHashed = rows.length > 0 && rows[0].code.length === 64;
+        const pass = res.status === 200 && isHashed;
+
+        recordResult('WhatsApp OTP', 'OTP stored as secure SHA-256 hash in database', '/api/auth/whatsapp/send',
+            'System generates WhatsApp OTP for verification',
+            'Code in database is a 64-character SHA-256 hash, never plaintext',
+            `Status: ${res.status}, Stored code length: ${rows[0]?.code?.length} chars`,
+            pass, 'CRITICAL');
+    }
     console.log(`${CYAN}   PENETRATION TEST EXECUTION SUMMARY                                   ${RESET}`);
     console.log(`${CYAN}========================================================================${RESET}`);
 

@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 
 // --- PLATFORM SETTINGS ---
+// Admin only: retrieves all platform settings including administrative and internal keys
 exports.getSettings = async (req, res) => {
     try {
         const [settings] = await db.execute('SELECT * FROM platform_settings');
@@ -10,6 +11,26 @@ exports.getSettings = async (req, res) => {
     } catch (err) {
         console.error('[getSettings]', err);
         res.status(500).json({ error: 'Failed to fetch settings' });
+    }
+};
+
+// Public/General: retrieves only non-sensitive visual and metadata settings
+exports.getPublicSettings = async (req, res) => {
+    try {
+        const allowedPublicKeys = [
+            'platform_name', 'logo_url', 'primary_color', 'accent_color', 
+            'welcome_message', 'footer_text', 'academic_year', 'school_name', 
+            'contact_email', 'contact_phone'
+        ];
+        const placeholders = allowedPublicKeys.map(() => '?').join(',');
+        const [settings] = await db.execute(
+            `SELECT \`key\`, \`value\`, \`type\`, category FROM platform_settings WHERE \`key\` IN (${placeholders})`,
+            allowedPublicKeys
+        );
+        res.json(settings);
+    } catch (err) {
+        console.error('[getPublicSettings]', err);
+        res.status(500).json({ error: 'Failed to fetch public settings' });
     }
 };
 

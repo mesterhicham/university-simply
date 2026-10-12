@@ -3,28 +3,33 @@ const path = require('path');
 const crypto = require('crypto');
 const fs = require('fs');
 
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, '..', 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
+// Ensure public uploads directory exists
+const publicUploadsDir = path.join(__dirname, '..', 'uploads');
+if (!fs.existsSync(publicUploadsDir)) {
+    fs.mkdirSync(publicUploadsDir, { recursive: true });
 }
 
-// Setup storage
-const storage = multer.diskStorage({
+// Ensure private uploads directory exists (never served via static route)
+const privateUploadsDir = path.join(__dirname, '..', 'private_uploads');
+if (!fs.existsSync(privateUploadsDir)) {
+    fs.mkdirSync(privateUploadsDir, { recursive: true });
+}
+
+// Helper to create disk storage
+const createStorage = (targetDir) => multer.diskStorage({
     destination: (req, file, cb) => {
-        cb(null, uploadsDir);
+        cb(null, targetDir);
     },
     filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + crypto.randomBytes(6).toString('hex');
+        const uniqueId = crypto.randomUUID();
         const ext = path.extname(file.originalname).toLowerCase();
-        cb(null, 'file-' + uniqueSuffix + ext);
+        cb(null, `file-${uniqueId}${ext}`);
     }
 });
 
-// C1 FIX: Strict file filter — requires BOTH valid extension AND matching mimetype
-// M3 FIX: Block SVG, HTML, PHP, and other dangerous file types
+// Allowed file types mapping
 const ALLOWED_FILE_TYPES = {
-    // Images (no SVG — SVG can contain scripts)
+    // Images
     'jpeg': ['image/jpeg'],
     'jpg': ['image/jpeg'],
     'png': ['image/png'],
@@ -50,7 +55,7 @@ const ALLOWED_FILE_TYPES = {
     'mov': ['video/quicktime'],
 };
 
-// Explicitly blocked extensions (defense in depth)
+// Explicitly blocked dangerous extensions
 const BLOCKED_EXTENSIONS = [
     'php', 'phtml', 'php3', 'php4', 'php5', 'phps',
     'exe', 'bat', 'cmd', 'com', 'msi', 'scr', 'ps1', 'vbs',
@@ -63,15 +68,13 @@ const BLOCKED_EXTENSIONS = [
 const fileFilter = (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase().replace('.', '');
 
-    // Block dangerous extensions first
     if (BLOCKED_EXTENSIONS.includes(ext)) {
-        return cb(new Error(`File type .${ext} is not allowed for security reasons`));
+        return cb(new Error(`File type .${ext} is blocked for security reasons`));
     }
 
-    // C1 FIX: Require BOTH valid extension AND matching mimetype (AND instead of OR)
     const allowedMimes = ALLOWED_FILE_TYPES[ext];
     if (!allowedMimes) {
-        return cb(new Error(`File type .${ext} is not allowed`));
+        return cb(new Error(`File extension .${ext} is not permitted`));
     }
 
     if (!allowedMimes.includes(file.mimetype)) {
@@ -81,10 +84,76 @@ const fileFilter = (req, file, cb) => {
     cb(null, true);
 };
 
-const upload = multer({
-    storage: storage,
-    limits: { fileSize: 25 * 1024 * 1024 }, // 25MB limit
-    fileFilter: fileFilter
+// File signature (Magic Bytes) inspection
+function verifyFileSignature(filePath, ext) {
+    try {
+        const buffer = Buffer.alloc(16);
+        const fd = fs.openSync(filePath, 'r');
+        fs.readSync(fd, buffer, 0, 16, 0);
+        fs.closeSync(fd);
+
+        if (ext === 'jpg' || ext === 'jpeg') {
+            return buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF;
+        }
+        if (ext === 'png') {
+            return buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47;
+        }
+        if (ext === 'gif') {
+            return buffer.toString('ascii', 0, 4) === 'GIF8';
+        }
+        if (ext === 'pdf') {
+            return buffer.toString('ascii', 0, 4) === '%PDF';
+        }
+        if (ext === 'webp') {
+            return buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP';
+        }
+        if (['docx', 'xlsx', 'pptx'].includes(ext)) {
+            return buffer[0] === 0x50 && buffer[1] === 0x4B;
+        }
+        if (ext === 'txt') {
+            for (let i = 0; i < 16; i++) {
+                if (buffer[i] === 0) return false;
+            }
+            return true;
+        }
+        if (ext === 'mp4') {
+            return buffer.toString('ascii', 4, 8) === 'ftyp';
+        }
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+// Middleware to enforce magic bytes verification
+function validateMagicBytes(req, res, next) {
+    if (!req.file) return next();
+    const ext = path.extname(req.file.originalname).toLowerCase().replace('.', '');
+    const isValid = verifyFileSignature(req.file.path, ext);
+    if (!isValid) {
+        try { fs.unlinkSync(req.file.path); } catch (_) {}
+        return res.status(400).json({ error: 'File content does not match the declared extension (invalid file signature).' });
+    }
+    next();
+}
+
+const publicUpload = multer({
+    storage: createStorage(publicUploadsDir),
+    limits: { fileSize: 15 * 1024 * 1024 }, // 15MB limit
+    fileFilter
 });
 
-module.exports = upload;
+const privateUpload = multer({
+    storage: createStorage(privateUploadsDir),
+    limits: { fileSize: 25 * 1024 * 1024 }, // 25MB limit
+    fileFilter
+});
+
+module.exports = {
+    upload: publicUpload,
+    publicUpload,
+    privateUpload,
+    validateMagicBytes,
+    publicUploadsDir,
+    privateUploadsDir
+};

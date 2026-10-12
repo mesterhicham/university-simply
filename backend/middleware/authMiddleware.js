@@ -22,6 +22,30 @@ const auth = async (req, res, next) => {
         }
 
         const user = users[0];
+
+        // Check user-level suspension if column exists
+        if (user.status && user.status === 'suspended') {
+            return res.status(403).json({ error: 'Account suspended. Access denied.' });
+        }
+
+        // Check role-specific suspension status
+        if (user.role === 'teacher') {
+            const [teacherRows] = await db.execute('SELECT status FROM teachers WHERE user_id = ?', [user.id]);
+            if (teacherRows.length > 0) {
+                if (teacherRows[0].status === 'suspended') {
+                    return res.status(403).json({ error: 'Teacher account is suspended. Access denied.' });
+                }
+                if (teacherRows[0].status === 'pending') {
+                    return res.status(403).json({ error: 'Teacher account is pending approval. Access denied.' });
+                }
+            }
+        } else if (user.role === 'student') {
+            const [studentRows] = await db.execute('SELECT status FROM students WHERE user_id = ?', [user.id]);
+            if (studentRows.length > 0 && studentRows[0].status === 'suspended') {
+                return res.status(403).json({ error: 'Student account is suspended. Access denied.' });
+            }
+        }
+
         req.user = {
             ...decoded,
             id: user.id,

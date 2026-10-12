@@ -7,15 +7,16 @@ const { auth, authorize } = require('../middleware/authMiddleware');
 // Protected routes
 router.use(auth);
 
-// Meetings routes (available to authenticated users depending on role)
-router.get('/settings', adminController.getSettings); // C5 FIX: Now requires auth
+// Public/General school visual settings
+router.get('/public-settings', adminController.getPublicSettings);
 router.get('/zoom/teacher-meetings', authorize('admin', 'teacher'), adminController.getTeacherMeetings);
 router.get('/zoom/student-meetings', authorize('admin', 'student'), adminController.getStudentMeetings);
 router.post('/zoom/meetings/:id/open', authorize('admin', 'teacher'), adminController.toggleRoomOpen);
 
-// Admin-only routes
+// Admin-only routes (strictly protected by authorize('admin'))
 router.use(authorize('admin'));
 
+router.get('/settings', adminController.getSettings);
 router.post('/settings', adminController.updateSetting);
 
 // Users Management

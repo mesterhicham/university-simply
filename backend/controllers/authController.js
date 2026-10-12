@@ -2,6 +2,7 @@ const db = require('../config/db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const whatsappService = require('../services/whatsappService');
 
 // C9 & M1 FIX: Transactional registration and strong password enforcement
 exports.register = async (req, res) => {
@@ -162,39 +163,58 @@ exports.setupFirstAdmin = async (req, res) => {
     const userId = req.user.id;
     const setupSecret = req.body?.setupSecret || req.headers['x-admin-setup-secret'];
 
-    // C1 FIX: If ADMIN_SETUP_SECRET is configured in environment, require it
-    if (process.env.ADMIN_SETUP_SECRET && setupSecret !== process.env.ADMIN_SETUP_SECRET) {
+    // Enforce ADMIN_SETUP_SECRET: mandatory in production, checked if set in non-production
+    if (process.env.NODE_ENV === 'production') {
+        if (!process.env.ADMIN_SETUP_SECRET || setupSecret !== process.env.ADMIN_SETUP_SECRET) {
+            return res.status(403).json({ error: 'Admin setup secret is mandatory in production and was invalid or missing.' });
+        }
+    } else if (process.env.ADMIN_SETUP_SECRET && setupSecret !== process.env.ADMIN_SETUP_SECRET) {
         return res.status(403).json({ error: 'Valid admin setup secret token is required.' });
     }
 
+    const conn = await db.getConnection();
     try {
-        // Atomic check across both user_roles and users to prevent race condition & privilege escalation
-        const roleId = crypto.randomUUID();
-        const [result] = await db.execute(
-            `INSERT INTO user_roles (id, user_id, role) 
-             SELECT ?, ?, 'admin' FROM DUAL 
-             WHERE NOT EXISTS (SELECT 1 FROM user_roles WHERE role = 'admin')
-               AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin')`,
-            [roleId, userId]
+        await conn.beginTransaction();
+
+        // Check if ANY admin already exists in users or user_roles with lock
+        const [existing] = await conn.execute(
+            "SELECT id FROM users WHERE role = 'admin' UNION SELECT user_id as id FROM user_roles WHERE role = 'admin' LIMIT 1 FOR UPDATE"
         );
 
-        if (result.affectedRows === 0) {
-            return res.status(400).json({ error: 'An admin already exists in the system.' });
+        if (existing.length > 0) {
+            await conn.rollback();
+            return res.status(403).json({ error: 'Admin setup is permanently disabled: an administrator already exists in the system.' });
         }
 
-        await db.execute("UPDATE users SET role = 'admin' WHERE id = ?", [userId]);
+        // Atomically grant admin role across user_roles and users tables in single transaction
+        const roleId = crypto.randomUUID();
+        await conn.execute(
+            "INSERT INTO user_roles (id, user_id, role) VALUES (?, ?, 'admin')",
+            [roleId, userId]
+        );
+        await conn.execute("UPDATE users SET role = 'admin' WHERE id = ?", [userId]);
 
+        await conn.commit();
         res.json({ success: true, message: 'First admin created successfully' });
     } catch (err) {
+        await conn.rollback();
         console.error('[setupFirstAdmin]', err);
         res.status(500).json({ error: 'Admin setup failed.' });
+    } finally {
+        conn.release();
     }
 };
 
 // --- WHATSAPP OTP ---
-// C6 FIX: Persistent database storage for OTPs across server restarts
-const OTP_MAX_ATTEMPTS = 5;
-const OTP_EXPIRY_MS = 10 * 60 * 1000; // 10 minutes
+// Phase 4 FIX: Secure SHA-256 hashed storage, 5-minute expiry, max 3 attempts, cooldown check, and provider integration
+const OTP_MAX_ATTEMPTS = 3;
+const OTP_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+const OTP_COOLDOWN_MS = 60 * 1000;   // 60-second cooldown between requests
+
+function hashOtpCode(code) {
+    const salt = process.env.JWT_SECRET || 'university-otp-salt-2026';
+    return crypto.createHash('sha256').update(String(code).trim() + salt).digest('hex');
+}
 
 // Periodic cleanup of expired OTPs from database
 setInterval(async () => {
@@ -206,34 +226,64 @@ setInterval(async () => {
 }, 5 * 60 * 1000);
 
 exports.sendWhatsAppOtp = async (req, res) => {
-    const { phone_number } = req.body;
-    if (!phone_number || phone_number.length < 8) {
+    const { phone_number, purpose } = req.body;
+    if (!phone_number || typeof phone_number !== 'string' || phone_number.trim().length < 8) {
+        return res.status(400).json({ error: 'Valid phone number is required (min 8 digits)' });
+    }
+
+    const cleanPhone = phone_number.trim().replace(/[^0-9+]/g, '');
+    if (cleanPhone.length < 8) {
         return res.status(400).json({ error: 'Valid phone number is required' });
     }
 
     try {
-        const cleanPhone = phone_number.trim();
-        // C2 FIX: Cryptographically secure random 6-digit code (CSPRNG)
+        // Cooldown check: reject if OTP was generated within the last 60 seconds
+        const [existing] = await db.execute(
+            'SELECT created_at, expires_at FROM otp_verifications WHERE phone_number = ? ORDER BY created_at DESC LIMIT 1',
+            [cleanPhone]
+        );
+
+        if (existing.length > 0) {
+            const timeSinceLast = Date.now() - new Date(existing[0].created_at).getTime();
+            if (timeSinceLast < OTP_COOLDOWN_MS) {
+                const waitSec = Math.ceil((OTP_COOLDOWN_MS - timeSinceLast) / 1000);
+                return res.status(429).json({ error: `Please wait ${waitSec} seconds before requesting a new code.` });
+            }
+        }
+
+        // Cryptographically secure random 6-digit code (CSPRNG)
         const code = crypto.randomInt(100000, 1000000).toString();
+        const codeHash = hashOtpCode(code);
         const expiresAt = Date.now() + OTP_EXPIRY_MS;
         const recordId = crypto.randomUUID();
+        const otpPurpose = (purpose && typeof purpose === 'string') ? purpose.trim() : 'phone_verification';
 
-        // C6 FIX: Persist OTP in database table
+        // Dispatch via WhatsApp messaging provider
+        const sendResult = await whatsappService.sendOtp(
+            cleanPhone,
+            `Your Simply University verification code is: ${code}. This code expires in 5 minutes.`
+        );
+
+        if (!sendResult.success) {
+            return res.status(503).json({ error: sendResult.error || 'Failed to dispatch WhatsApp OTP' });
+        }
+
+        // Store secure hash only (never plaintext code)
         await db.execute('DELETE FROM otp_verifications WHERE phone_number = ?', [cleanPhone]);
         await db.execute(
             'INSERT INTO otp_verifications (id, phone_number, code, attempts, expires_at) VALUES (?, ?, ?, 0, ?)',
-            [recordId, cleanPhone, code, expiresAt]
+            [recordId, cleanPhone, codeHash, expiresAt]
         );
-
-        console.log(`[WhatsApp OTP] Code generated for ${cleanPhone.substring(0, 4)}****`);
 
         res.json({
             success: true,
-            message: 'OTP sent successfully'
+            message: sendResult.simulated ? 'OTP generated in simulation mode' : 'OTP dispatched successfully via WhatsApp',
+            expires_in: 300,
+            simulated: Boolean(sendResult.simulated)
         });
     } catch (err) {
         console.error('[sendWhatsAppOtp]', err);
-        res.status(500).json({ error: 'Failed to send OTP.' });
+        res.status(500).json({ error: 'Failed to process WhatsApp OTP request.' });
     }
 };
 
@@ -243,7 +293,9 @@ exports.verifyWhatsAppOtp = async (req, res) => {
         return res.status(400).json({ error: 'Phone number and code are required' });
     }
 
-    const cleanPhone = phone_number.trim();
+    const cleanPhone = phone_number.trim().replace(/[^0-9+]/g, '');
+    const cleanCode = code.toString().trim();
+
     try {
         const [rows] = await db.execute(
             'SELECT * FROM otp_verifications WHERE phone_number = ? ORDER BY created_at DESC LIMIT 1',
@@ -251,7 +303,7 @@ exports.verifyWhatsAppOtp = async (req, res) => {
         );
 
         if (rows.length === 0) {
-            return res.status(400).json({ error: 'No OTP requested for this number or expired' });
+            return res.status(400).json({ error: 'No OTP requested for this number or code expired.' });
         }
 
         const stored = rows[0];
@@ -264,15 +316,22 @@ exports.verifyWhatsAppOtp = async (req, res) => {
         const currentAttempts = (stored.attempts || 0) + 1;
         if (currentAttempts > OTP_MAX_ATTEMPTS) {
             await db.execute('DELETE FROM otp_verifications WHERE phone_number = ?', [cleanPhone]);
-            return res.status(429).json({ error: 'Too many verification attempts. Please request a new code.' });
+            return res.status(429).json({ error: 'Maximum verification attempts exceeded. Please request a new code.' });
         }
 
-        if (stored.code !== code.toString().trim()) {
+        // Verify hash
+        const candidateHash = hashOtpCode(cleanCode);
+        const isMatch = (stored.code === candidateHash) || (stored.code === cleanCode);
+
+        if (!isMatch) {
             await db.execute('UPDATE otp_verifications SET attempts = ? WHERE id = ?', [currentAttempts, stored.id]);
-            return res.status(400).json({ error: 'Invalid verification code' });
+            return res.status(400).json({
+                error: 'Invalid verification code',
+                remaining_attempts: Math.max(0, OTP_MAX_ATTEMPTS - currentAttempts)
+            });
         }
 
-        // OTP verified successfully - clear OTP record
+        // OTP verified successfully - immediately delete OTP record to prevent replay attacks
         await db.execute('DELETE FROM otp_verifications WHERE phone_number = ?', [cleanPhone]);
 
         // If user is authenticated, update their profile

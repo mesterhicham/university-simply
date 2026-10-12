@@ -333,8 +333,22 @@ exports.getFormationProgressDashboard = async (req, res) => {
 
         const [enrollments] = await db.execute(enrollmentSql, params);
 
-        const [allContent] = await db.execute('SELECT id, formation_id FROM formation_content');
-        const [allProgress] = await db.execute('SELECT * FROM formation_progress');
+        let contentSql = 'SELECT fc.id, fc.formation_id FROM formation_content fc';
+        let progressSql = `
+            SELECT fp.* 
+            FROM formation_progress fp
+            JOIN formation_enrollments fe ON fp.enrollment_id = fe.id
+            JOIN formations f ON fe.formation_id = f.id
+        `;
+        const filterParams = [];
+        if (req.user.role !== 'admin') {
+            contentSql += ' JOIN formations f ON fc.formation_id = f.id WHERE f.created_by = ?';
+            progressSql += ' WHERE f.created_by = ?';
+            filterParams.push(req.user.id);
+        }
+
+        const [allContent] = await db.execute(contentSql, filterParams);
+        const [allProgress] = await db.execute(progressSql, filterParams);
 
         const formattedEnrollments = enrollments.map(e => ({
             id: e.id,

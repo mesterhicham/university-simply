@@ -1,17 +1,32 @@
 const express = require('express');
 const router = express.Router();
 const uploadController = require('../controllers/uploadController');
-const upload = require('../middleware/uploadMiddleware');
+const { publicUpload, privateUpload, validateMagicBytes } = require('../middleware/uploadMiddleware');
 const { auth } = require('../middleware/authMiddleware');
 
+// Public upload route (avatars, banners, course thumbnails)
 router.post('/', auth, (req, res, next) => {
-    upload.single('file')(req, res, (err) => {
+    publicUpload.single('file')(req, res, (err) => {
         if (err) {
-            console.error('[Upload Middleware Error]:', err.message);
+            console.error('[Public Upload Error]:', err.message);
             return res.status(400).json({ error: err.message || 'File upload failed' });
         }
-        uploadController.uploadFile(req, res);
+        next();
     });
-});
+}, validateMagicBytes, uploadController.uploadFile);
+
+// Private upload route (sensitive student documents, payment receipts, submissions)
+router.post('/private', auth, (req, res, next) => {
+    privateUpload.single('file')(req, res, (err) => {
+        if (err) {
+            console.error('[Private Upload Error]:', err.message);
+            return res.status(400).json({ error: err.message || 'Private file upload failed' });
+        }
+        next();
+    });
+}, validateMagicBytes, uploadController.uploadPrivateFile);
+
+// Authenticated, authorized private file access endpoint
+router.get('/private/:filename', auth, uploadController.downloadPrivateFile);
 
 module.exports = router;
