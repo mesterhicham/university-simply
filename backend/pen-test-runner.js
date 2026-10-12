@@ -1,4 +1,17 @@
 require('dotenv').config();
+
+// Phase 7 FIX: Production Barrier
+if (process.env.NODE_ENV === 'production') {
+    console.error('[SECURITY ERROR] Penetration test suite is strictly prohibited in production environments.');
+    process.exit(1);
+}
+
+const dbName = (process.env.DB_NAME || '').toLowerCase();
+if (dbName.includes('prod') || dbName.includes('live')) {
+    console.error(`[SECURITY ERROR] Target database "${dbName}" appears to be a production database. Penetration testing aborted.`);
+    process.exit(1);
+}
+
 const http = require('http');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
